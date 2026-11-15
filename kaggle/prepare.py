@@ -13,7 +13,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=(*GPU_STAGES, "select", "score"))
     parser.add_argument("--id", required=True, help="Kaggle owner/kernel-slug")
-    parser.add_argument("--checkpoint-dataset", required=True, help="Private owner/dataset-slug")
+    checkpoint = parser.add_mutually_exclusive_group(required=True)
+    checkpoint.add_argument("--checkpoint-model", help="Pinned owner/model/framework/variation/version")
+    checkpoint.add_argument("--checkpoint-dataset", help="Private owner/dataset-slug")
     parser.add_argument("--brats-dataset", default="dschettler8845/brats-2021-task1")
     parser.add_argument("--kernel-source", action="append", default=[])
     parser.add_argument("--out", required=True, type=Path)
@@ -22,9 +24,13 @@ def main():
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int)
     args = parser.parse_args()
-    all_ids = [args.id, args.checkpoint_dataset, args.brats_dataset, *args.kernel_source]
+    all_ids = [args.id, args.brats_dataset, *args.kernel_source]
+    if args.checkpoint_dataset:
+        all_ids.append(args.checkpoint_dataset)
     if any(not re.fullmatch(r"[\w-]+/[\w-]+", ref) for ref in all_ids):
         parser.error("Kaggle IDs must use owner/slug")
+    if args.checkpoint_model and not re.fullmatch(r"(?:[\w-]+/){4}[1-9][0-9]*", args.checkpoint_model):
+        parser.error("Checkpoint model must use owner/model/framework/variation/version")
     if len(set(args.kernel_source)) != len(args.kernel_source):
         parser.error("List each upstream kernel once")
     count = args.shards if args.shards is not None else {"validate": 3, "test": 8}.get(args.stage, 1)
@@ -41,14 +47,17 @@ def main():
         parser.error(f"{args.stage} requires {required} upstream kernel source(s)")
 
     gpu = args.stage in GPU_STAGES
-    datasets = [args.brats_dataset, args.checkpoint_dataset] if gpu else []
+    checkpoint_ref = args.checkpoint_model or args.checkpoint_dataset
+    datasets = [args.brats_dataset] if gpu else []
+    if gpu and args.checkpoint_dataset:
+        datasets.append(args.checkpoint_dataset)
     repository = Path(__file__).resolve().parents[1]
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
     settings = {
         "stage": args.stage, "shard": args.shard, "shards": count,
         "repo": args.repo, "branch": args.branch,
         "kernel_sources": args.kernel_source,
-        "identity": {"commit": commit, "brats": args.brats_dataset, "checkpoint": args.checkpoint_dataset},
+        "identity": {"commit": commit, "brats": args.brats_dataset, "checkpoint": checkpoint_ref},
     }
     args.out.mkdir(parents=True, exist_ok=True)
     code_file = "run_e1.py"
@@ -64,6 +73,7 @@ def main():
         "enable_gpu": gpu,
         "enable_internet": True,
         "dataset_sources": datasets,
+        "model_sources": [args.checkpoint_model] if gpu and args.checkpoint_model else [],
         "kernel_sources": args.kernel_source,
     }
     (args.out / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

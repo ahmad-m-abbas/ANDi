@@ -34,6 +34,19 @@ def one_file(root, name):
     return files[0]
 
 
+def mounted_checkpoint(ref):
+    parts = ref.split("/")
+    if len(parts) == 2:
+        return one_file(mount(ref), "232_ema_ckpt.pt")
+    owner, model, framework, variation, version = parts
+    suffix = Path(model, framework, variation, version)
+    roots = (INPUT / "models" / owner / suffix, INPUT / suffix)
+    for root in roots:
+        if root.is_dir():
+            return one_file(root, "232_ema_ckpt.pt")
+    raise FileNotFoundError(f"Mounted checkpoint model {ref} was not found under {INPUT}")
+
+
 def checkout(settings, repo):
     commit = settings["identity"]["commit"]
     subprocess.run(
@@ -106,7 +119,7 @@ def main(settings):
             ids = read_ids(repo, settings)
             dataset = Path(work) / "BraTS21"
             stage_data(mount(settings["identity"]["brats"]), ids, dataset)
-            checkpoint = one_file(mount(settings["identity"]["checkpoint"]), "232_ema_ckpt.pt")
+            checkpoint = mounted_checkpoint(settings["identity"]["checkpoint"])
             command.extend(("--data", str(dataset), "--checkpoint", str(checkpoint)))
         for kernel in settings["kernel_sources"]:
             command.extend(("--input", str(one_file(mount(kernel), ARTIFACT).parent)))

@@ -10,15 +10,15 @@ The jobs run in Kaggle after `kaggle kernels push` returns. All inference uses t
    git push -u origin codex/brats21-e1-kaggle
    ```
 
-2. Authenticate the [Kaggle CLI](https://github.com/Kaggle/kaggle-cli) locally. Create a **private** Kaggle dataset containing the unchanged `pyramid/232_ema_ckpt.pt` file. The runner checks the SHA-256 before loading it. The MRI input defaults to [BraTS 2021 Task 1](https://www.kaggle.com/datasets/dschettler8845/brats-2021-task1). The launcher accepts the extracted NIfTI folders or a mounted training tar and checks that all five files exist for each assigned subject.
+2. Use the private [Kaggle Model version](https://www.kaggle.com/models/ahmadabbas176/232-ema-ckpt-pt/PyTorch/default/1) as the checkpoint input. The runner checks the SHA-256 before loading it. The MRI input defaults to [BraTS 2021 Task 1](https://www.kaggle.com/datasets/dschettler8845/brats-2021-task1). The launcher accepts the extracted NIfTI folders or a mounted training tar and checks that all five files exist for each assigned subject.
 
 3. Choose one GPU type for all inference jobs. These examples use one GPU from the T4 runtime. Use a different accelerator consistently if available in your account.
 
 Run the following from the repository root in Bash. Use a new kernel name prefix for each independent experiment so the downstream jobs attach the intended outputs.
 
 ```bash
-OWNER=your-kaggle-username
-CHECKPOINT_DATASET="$OWNER/andi-e1-checkpoint"
+OWNER=ahmadabbas176
+CHECKPOINT_MODEL="$OWNER/232-ema-ckpt-pt/pytorch/default/1"
 PREFIX=andi-e1
 ACCELERATOR=NvidiaTeslaT4
 JOB_DIR="$(mktemp -d)"
@@ -28,7 +28,7 @@ prepare() {
   shift 2
   python3 -B kaggle/prepare.py "$stage" \
     --id "$OWNER/$PREFIX-$name" --out "$JOB_DIR/$name" \
-    --checkpoint-dataset "$CHECKPOINT_DATASET" "$@"
+    --checkpoint-model "$CHECKPOINT_MODEL" "$@"
 }
 push_gpu() {
   kaggle kernels push -p "$JOB_DIR/$1" --accelerator "$ACCELERATOR"
@@ -37,7 +37,7 @@ push_gpu() {
 
 The generated jobs clone the public GitHub branch and check out the exact commit recorded by `prepare.py`.
 
-Use the same source, checkpoint dataset version, BraTS21 dataset version, and GPU type throughout. GPU stage manifests record the commit, input dataset IDs, checkpoint hash, GPU model and CUDA software versions. The join checks matching provenance, subject coverage and the validation freeze.
+Use the same source, checkpoint model version, BraTS21 dataset version, and GPU type throughout. GPU stage manifests record the commit, dataset and model references, checkpoint hash, GPU model and CUDA software versions. The join checks matching provenance, subject coverage and the validation freeze.
 
 ## Submit in order
 
