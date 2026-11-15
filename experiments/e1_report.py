@@ -18,7 +18,9 @@ def load(path):
 def write_diagnostics():
     diagnostics = load(OUTPUT / "calibration" / "diagnostics.json")
     steps = diagnostics["timesteps"]
-    fig, plots = plt.subplots(1, 3, figsize=(13, 3.4), layout="constrained")
+    quantiles = diagnostics.get("log_residual_quantiles")
+    fig, plots = plt.subplots(1, 4 if quantiles else 3,
+                              figsize=(17 if quantiles else 13, 3.4), layout="constrained")
     ax = plots[0]
     ax.plot(range(50, 250), np.asarray(diagnostics["noise_fraction"])[50:250] * 100)
     ax.axvspan(75, 199, alpha=0.15, label="Baseline window")
@@ -33,6 +35,13 @@ def write_diagnostics():
     heat = ax.imshow(off_diagonal, extent=(74.5, 199.5, 199.5, 74.5), cmap="viridis")
     ax.set(xlabel="Timestep", ylabel="Timestep", title="Foreground correlation across timesteps")
     fig.colorbar(heat, ax=ax, shrink=0.8)
+    if quantiles:
+        ax = plots[3]
+        low, median, high = quantiles
+        ax.fill_between(steps, low, high, alpha=0.18, label="10th–90th percentile")
+        ax.plot(steps, median, label="Median")
+        ax.set(xlabel="Timestep", ylabel="Log squared residual", title="Sampled foreground residuals")
+        ax.legend(frameon=False)
     fig.savefig(OUTPUT / "diagnostics.png", dpi=180)
     plt.close(fig)
 
@@ -136,6 +145,20 @@ def main(embedded_baseline=False):
         "centered float16 foreground format as the grouped archive, with packed brain/label masks and per-region "
         "statistics. Full-volume inference maps were retained separately for exact filtering and scoring.",
     ]
+    if embedded_baseline and all("median_peak_cuda_gib" in row["timing"] for row in data["results"].values()):
+        lines += ["", "Peak PyTorch CUDA allocation, median across timing subjects", "",
+                  "| Config | GiB |", "|---|---:|"]
+        for name, row in data["results"].items():
+            lines.append(f"| {name} | {row['timing']['median_peak_cuda_gib']:.3f} |")
+    if (OUTPUT / "noise_seeds.json").exists():
+        seeds = load(OUTPUT / "noise_seeds.json")
+        lines += ["", "## Evaluation noise sensitivity", "",
+                  f"The baseline and selected 25-step schedule were reevaluated with two independent noise seeds "
+                  f"on {len(seeds['subjects'])} calibration subjects. These scores are descriptive.", "",
+                  "| Seed | Config | MF5 AUPRC | MF5 Dice |", "|---:|---|---:|---:|"]
+        for seed, methods in seeds["trials"].items():
+            for name, row in methods.items():
+                lines.append(f"| {seed} | {name} | {row['auprc']:.6f} | {row['dice']:.6f} |")
     if embedded_baseline:
         lines += [
             "", "## Reproduction", "",

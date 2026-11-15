@@ -16,7 +16,7 @@ INPUT = Path("/kaggle/input")
 OUTPUT = Path("/kaggle/working/andi-e1")
 ARTIFACT = "andi-e1-artifact.json"
 MODALITIES = ("flair", "t1", "t1ce", "t2", "seg")
-GPU_STAGES = ("smoke", "calibrate", "validate", "test")
+GPU_STAGES = ("smoke", "probe", "calibrate", "validate", "test", "noise")
 
 
 def mount(input_id):
@@ -64,6 +64,8 @@ def read_ids(repo, settings):
         ids = [row["BraTS21ID"] for row in csv.DictReader(stream)]
     if stage == "smoke":
         return ids[:1]
+    if stage in ("probe", "noise"):
+        return ids[:2]
     if stage == "calibrate":
         return ids[:8]
     if stage == "validate":
@@ -100,7 +102,7 @@ def stage_data(root, ids, destination):
     raise FileNotFoundError(f"Missing {len(names)} required BraTS21 NIfTI files, e.g. {sorted(names)[:5]}")
 
 
-def main(settings):
+def main(settings, *, output_path=OUTPUT, local_inputs=(), staged_data=None, gpu=None, extra_args=()):
     with TemporaryDirectory(prefix="andi-e1-") as work:
         repo = Path(work) / "ANDi"
         checkout(settings, repo)
@@ -114,23 +116,31 @@ def main(settings):
             sys.executable, "-u", "-m", "experiments.e1_cuda", stage,
             "--identity", json.dumps(settings["identity"]), "--output", str(output),
             "--shard", str(settings["shard"]), "--shards", str(settings["shards"]),
+            *extra_args,
         ]
         if stage in GPU_STAGES:
-            ids = read_ids(repo, settings)
-            dataset = Path(work) / "BraTS21"
-            stage_data(mount(settings["identity"]["brats"]), ids, dataset)
+            dataset = staged_data
+            if dataset is None:
+                dataset = Path(work) / "BraTS21"
+                stage_data(mount(settings["identity"]["brats"]), read_ids(repo, settings), dataset)
             checkpoint = mounted_checkpoint(settings["identity"]["checkpoint"])
             command.extend(("--data", str(dataset), "--checkpoint", str(checkpoint)))
         for kernel in settings["kernel_sources"]:
             command.extend(("--input", str(one_file(mount(kernel), ARTIFACT).parent)))
+        for artifact in local_inputs:
+            command.extend(("--input", str(artifact)))
         env = os.environ | {
             "MPLBACKEND": "Agg", "OMP_NUM_THREADS": "4", "PYTHONDONTWRITEBYTECODE": "1",
             "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         }
+        if gpu is not None:
+            env["CUDA_VISIBLE_DEVICES"] = gpu
         print(f"Running {stage} on commit {settings['identity']['commit']}", flush=True)
         subprocess.run(command, cwd=repo, env=env, check=True)
         total = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
         if total > 19_000_000_000:
             raise RuntimeError(f"Stage produced {total} bytes. Use a larger shard count to fit Kaggle output.")
-        shutil.move(output, OUTPUT)
-        print(f"Saved {total:,} bytes to {OUTPUT}", flush=True)
+        if output_path.exists():
+            raise FileExistsError(output_path)
+        shutil.move(output, output_path)
+        print(f"Saved {total:,} bytes to {output_path}", flush=True)

@@ -39,6 +39,28 @@ The generated jobs clone the public GitHub branch and check out the exact commit
 
 Use the same source, checkpoint model version, BraTS21 dataset version, and GPU type throughout. GPU stage manifests record the commit, dataset and model references, checkpoint hash, GPU model and CUDA software versions. The join checks matching provenance, subject coverage and the validation freeze.
 
+## One notebook cell
+
+With the same two inputs mounted, Internet enabled, and GPU T4 ×2 selected, put the cell below in a Kaggle notebook and use **Save Version → Save & Run All**. Start with `PROBE = True`. The preflight uses two validation cases to exercise all candidate schedules, validation selection, cache export, and real 125-step versus 25-step timing. It writes `/kaggle/working/andi-e1-probe/report/probe.json`.
+
+```python
+import subprocess, sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+PROBE = True
+branch = "codex/brats21-e1-kaggle"
+with TemporaryDirectory() as work:
+    repo = Path(work) / "ANDi"
+    subprocess.run(["git", "clone", "--single-branch", "--branch", branch,
+                    "https://github.com/ahmad-m-abbas/ANDi.git", str(repo)], check=True)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    cmd = [sys.executable, "-u", "kaggle/one_cell.py", commit]
+    subprocess.run(cmd + (["--probe"] if PROBE else []), cwd=repo, check=True)
+```
+
+After the preflight, set `PROBE = False` for the full experiment. The runner shares the inference shards across the available GPUs and runs the paired timing panel without concurrent inference. It also compares the 125-step baseline and selected 25-step schedule on two calibration subjects with a second noise seed. Results and figures are written to `/kaggle/working/andi-e1-full/report`. The new timestep caches are under `/kaggle/working/andi-e1-full` alongside the report. The full one-cell job must finish within Kaggle's session limit. The smaller jobs below can each be saved independently.
+
 ## Submit in order
 
 Use `kaggle kernels status "$OWNER/$PREFIX-<name>"` to check a job. Advance to the next block once all its required inputs have completed successfully. Each job name is distinct so a successful shard remains available if another shard needs a retry.

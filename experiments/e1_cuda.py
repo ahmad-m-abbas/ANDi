@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from scipy.ndimage import median_filter
 
 from diffusion import Diffusion
 from experiments import e1
@@ -17,7 +18,7 @@ from modules import UNet
 
 CHECKPOINT_SHA = "ff76a1fadd74e839fea6d993f0b17b1e830d1a0bf127ef2f2e1e10afd92216bb"
 MANIFEST = "andi-e1-artifact.json"
-GPU_STAGES = ("smoke", "calibrate", "validate", "test")
+GPU_STAGES = ("smoke", "probe", "calibrate", "validate", "test", "noise")
 STAGES = (*GPU_STAGES, "select", "score")
 
 
@@ -120,8 +121,9 @@ def single(items, stage):
 
 def stage_inputs(args, identity):
     dependencies = {
-        "smoke": (), "calibrate": (), "validate": ("calibrate",),
-        "select": ("calibrate", "validation"), "test": ("select",), "score": ("select", "test"),
+        "smoke": (), "probe": (), "calibrate": (), "validate": ("calibrate",),
+        "select": ("calibrate", "validation"), "test": ("select",), "noise": ("select",),
+        "score": ("select", "test", "noise") if getattr(args, "include_noise", False) else ("select", "test"),
     }[args.stage]
     items = {key: [] for key in dependencies}
     for path in args.input:
@@ -164,6 +166,60 @@ def smoke(conf, inference):
     e1.write_json(e1.OUTPUT / "smoke.json", {"timesteps": [50, 75, 199], "seconds": seconds})
 
 
+def noise_check(conf, inference, steps, ids):
+    dataset = e1.MRI_Volume(conf).dataset
+    configs = {"baseline": list(e1.BASE), "selected_25": steps}
+    subject_rows = list(range(len(ids)))
+    trials = {}
+    for seed in (conf["seed"], conf["seed"] + 1000):
+        inference.seed = seed
+        scores = {name: [] for name in configs}
+        truth = []
+        for row in subject_rows:
+            volume, label = dataset[row]
+            maps, _ = inference.predict(inference.batches(volume.unsqueeze(0)), None, row, configs)
+            truth.append(label.numpy())
+            for name, score in maps.items():
+                scores[name].append(median_filter(score, size=5))
+        labels = np.stack(truth)
+        trials[str(seed)] = {}
+        for name, values in scores.items():
+            maps = np.stack(values)
+            low, high = float(maps.min()), float(maps.max())
+            dice = [e1.score_volume(scores, truth, low, high)[0] for scores, truth in zip(maps, labels)]
+            ap = e1.pooled_average_precision(torch.from_numpy(maps), torch.from_numpy(labels))
+            trials[str(seed)][name] = {"auprc": ap, "dice": float(np.mean(dice))}
+    e1.write_json(e1.OUTPUT / "noise_seeds.json", dict(subjects=ids, steps=steps, trials=trials))
+
+
+def probe(conf, inference, ids, backend):
+    # A separate artifact from production. No official test data is opened.
+    e1.infer_split(conf, inference, "val", "calibration", ids[:1],
+                   {"baseline": e1.BASE}, provenance=backend)
+    with np.load(e1.OUTPUT / "calibration/maps" / f"{ids[0]}.npz") as data:
+        logs = np.maximum(data["logs"].reshape(len(e1.BASE), -1), np.log(1e-30))
+    configs, groups = e1.candidates(inference, np.corrcoef(logs), contiguous=True)
+    stage = e1.OUTPUT / "validation"
+    e1.infer_split(conf, inference, "val", "validation", ids[1:2],
+                   {"baseline": e1.BASE, **configs}, provenance=backend)
+    with np.load(stage / "maps" / f"{ids[1]}.npz") as maps:
+        if not all(np.isfinite(maps[name]).all() for name in configs):
+            raise ValueError("The CUDA probe produced non-finite candidate scores")
+        np.testing.assert_array_equal(maps["k25_t"], maps["w75_199"])
+    e1.select_validation(ids[1:2], configs, groups, embedded_baseline=True)
+    volume, _ = e1.MRI_Volume(conf).dataset[1]
+    batches = inference.batches(volume.unsqueeze(0))
+    actual = {}
+    for name, steps in (("baseline", e1.BASE), ("k25_t", configs["k25_t"])):
+        direct, seconds = inference.predict(batches, None, 1, {name: steps})
+        np.testing.assert_allclose(direct[name], e1.saved_map(stage, ids[1], name), atol=1e-10, rtol=1e-5)
+        actual[name] = seconds
+    e1.write_json(e1.OUTPUT / "probe.json", {
+        "calibration_subject": ids[0], "validation_subject": ids[1],
+        "candidates": configs, "inference_seconds": actual,
+    })
+
+
 def run(args, identity):
     stage = args.stage
     items = stage_inputs(args, identity)
@@ -185,9 +241,12 @@ def run(args, identity):
         with torch.inference_mode():
             smoke(conf, inference)
         return backend, ["smoke.json", "provenance.json"]
+    if stage == "probe":
+        probe(conf, inference, ids, backend)
+        return backend, ["probe.json", "provenance.json", "frozen.json", "validation/metrics"]
     if stage == "calibrate":
         correlation = e1.calibrate(conf, inference, provenance=backend)
-        configs, groups = e1.candidates(inference, correlation)
+        configs, groups = e1.candidates(inference, correlation, contiguous=True)
         path = e1.OUTPUT / "calibration" / "candidates.json"
         e1.write_json(path, dict(configs=configs, groups=groups))
         return backend, ["calibration/diagnostics.json", "calibration/candidates.json"]
@@ -208,13 +267,20 @@ def run(args, identity):
 
     selection = single(items, "select")
     frozen = read(selection / "frozen.json")
+    if stage == "noise":
+        noise_check(conf, inference, frozen["configs"][frozen["winners"]["k25"]], ids[:2])
+        return backend, ["noise_seeds.json"]
     if set(ids) & set(frozen["validation_subjects"]) or frozen["baseline"] != list(e1.BASE):
         raise ValueError("Test split or frozen baseline is invalid")
     configs = {"baseline": list(e1.BASE), **frozen["configs"]}
     panel = test_panel(ids)
     freeze_sha = digest(selection / "frozen.json")
     if stage == "test":
-        subset = shard(ids, args.shard, args.shards)
+        if args.timing_only:
+            subset = panel
+        else:
+            eligible = [subject for subject in ids if subject not in panel] if args.exclude_timing else ids
+            subset = shard(eligible, args.shard, args.shards)
         e1.infer_split(conf, inference, split, "test", subset, configs,
                        [subject for subject in panel if subject in subset], provenance=backend)
         e1.write_json(e1.OUTPUT / "test" / "freeze.json", {"sha256": freeze_sha})
@@ -231,11 +297,16 @@ def run(args, identity):
         else:
             shutil.copyfile(source, target)
     e1.score_test(ids, frozen["configs"], panel, embedded_baseline=True)
+    if "noise" in items:
+        shutil.copyfile(single(items, "noise") / "noise_seeds.json", e1.OUTPUT / "noise_seeds.json")
     from experiments.e1_report import main as report
 
     report(embedded_baseline=True)
-    return backend, ["frozen.json", "provenance.json", "calibration", "validation", "results.json",
-                     "report.md", "diagnostics.png", "pareto_mf5.png", "example.png"]
+    outputs = ["frozen.json", "provenance.json", "calibration", "validation", "results.json",
+               "report.md", "diagnostics.png", "pareto_mf5.png", "example.png"]
+    if "noise" in items:
+        outputs.append("noise_seeds.json")
+    return backend, outputs
 
 
 def main():
@@ -248,6 +319,10 @@ def main():
     parser.add_argument("--input", action="append", type=Path, default=[])
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
+    timings = parser.add_mutually_exclusive_group()
+    timings.add_argument("--timing-only", action="store_true")
+    timings.add_argument("--exclude-timing", action="store_true")
+    parser.add_argument("--include-noise", action="store_true")
     args = parser.parse_args()
     if args.stage in GPU_STAGES and (args.data is None or args.checkpoint is None):
         parser.error("GPU stages require --data and --checkpoint")

@@ -39,7 +39,7 @@ def main():
     if args.stage not in ("validate", "test") and count != 1:
         parser.error("Only validation and test inference can be sharded")
     inputs = len(args.kernel_source)
-    required = {"validate": 1, "test": 1}.get(args.stage, 0)
+    required = {"validate": 1, "test": 1, "noise": 1}.get(args.stage, 0)
     if args.stage in ("select", "score"):
         if inputs < 2:
             parser.error("Scoring requires a parent stage and the inference shards")

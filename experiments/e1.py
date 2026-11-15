@@ -213,7 +213,7 @@ def coordinates(inference):
     return dict(t=np.arange(len(alpha)), noise=1 - alpha, log_snr=np.log(alpha / (1 - alpha)))
 
 
-def candidates(inference, correlation):
+def candidates(inference, correlation, *, contiguous=False):
     spaces = coordinates(inference)
     configs = {}
     families = {}
@@ -222,6 +222,9 @@ def candidates(inference, correlation):
         for key, coordinate in spaces.items():
             family[f"k{budget}_{key}"] = spaced(75, 199, budget, coordinate)
         family[f"k{budget}_diverse"] = diverse(correlation, budget)
+        if contiguous:
+            family[f"k{budget}_low"] = list(BASE[:budget])
+            family[f"k{budget}_high"] = list(BASE[-budget:])
         for seed in RANDOM_SEEDS:
             sample = np.random.default_rng(seed).choice(BASE, size=budget, replace=False)
             family[f"k{budget}_random{seed}"] = sorted(sample.tolist())
@@ -395,12 +398,17 @@ def infer_split(conf, inference, split, stage, subset, configs, panel=(), *, pro
         if new:
             new.save()
         benchmarks = {}
+        peak_cuda_bytes = {}
         if subject in panel:
             methods = list(configs.items()) if embedded_baseline else [("baseline", BASE), *configs.items()]
             # Rotate order across panel subjects to reduce thermal/order bias.
             for method in np.roll(np.arange(len(methods)), panel.index(subject)):
                 name, ts = methods[method]
+                if embedded_baseline:
+                    torch.cuda.reset_peak_memory_stats(inference.device)
                 direct, inference_seconds = inference.predict(batches, states, index, {name: ts})
+                if embedded_baseline:
+                    peak_cuda_bytes[name] = torch.cuda.max_memory_allocated(inference.device)
                 reference = archived(split, subject)[0] if name == "baseline" and not embedded_baseline else maps[name]
                 np.testing.assert_allclose(direct[name], reference, rtol=1e-5, atol=1e-10)
                 benchmarks[name] = inference_seconds
@@ -408,7 +416,8 @@ def infer_split(conf, inference, split, stage, subset, configs, panel=(), *, pro
             maps["label"] = np.packbits(truth)
         write_npz(path, compressed=embedded_baseline, **maps)
         write_json(time_path, dict(subject=subject, inference_s=seconds, preprocessing_s=prep_seconds,
-                                  noise_replay_setup_s=noise_setup_seconds, timings_s=benchmarks))
+                                  noise_replay_setup_s=noise_setup_seconds, timings_s=benchmarks,
+                                  peak_cuda_bytes=peak_cuda_bytes))
         print(f"{stage} {subject} ({index + 1}/{len(ids)}): {seconds:.2f} s", flush=True)
 
 
@@ -430,6 +439,7 @@ def calibrate(conf, inference, *, provenance=None):
     write_json(directory / "diagnostics.json", dict(
         timesteps=BASE, correlation=correlation.tolist(), sampled_single_step_ap=aps,
         subject_ids=subset, noise_fraction=coordinates(inference)["noise"].tolist(),
+        log_residual_quantiles=np.quantile(log_samples, [0.1, 0.5, 0.9], axis=1).tolist(),
     ))
     return correlation
 
@@ -521,6 +531,9 @@ def score_test(ids, configs, panel, *, embedded_baseline=False):
                 median_inference_s=float(np.median(sec)), median_total_s=float(np.median(total)),
                 inference_iqr_s=np.quantile(sec, [0.25, 0.75]).tolist(),
             )
+            if all(name in row.get("peak_cuda_bytes", {}) for row in times):
+                sizes = [row["peak_cuda_bytes"][name] for row in times]
+                results[name]["timing"]["median_peak_cuda_gib"] = float(np.median(sizes) / 2**30)
             for scope in ("inference", "total"):
                 results[name]["timing"][f"{scope}_speedup"] = (
                     results["baseline"]["timing"][f"median_{scope}_s"]
