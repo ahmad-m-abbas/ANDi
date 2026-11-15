@@ -1,8 +1,6 @@
 """Produce the BraTS21 E1 tables and figures from the completed run."""
 
 import json
-from pathlib import Path
-
 import matplotlib
 import numpy as np
 
@@ -22,15 +20,17 @@ def write_diagnostics():
     fig, plots = plt.subplots(1, 3, figsize=(13, 3.4), layout="constrained")
     ax = plots[0]
     ax.plot(range(50, 250), np.asarray(diagnostics["noise_fraction"])[50:250] * 100)
-    ax.axvspan(75, 199, alpha=0.15)
+    ax.axvspan(75, 199, alpha=0.15, label="Baseline window")
+    ax.legend(frameon=False, loc="upper left")
     ax.set(xlabel="Timestep", ylabel="Squared noise coefficient (%)")
     ax = plots[1]
     ax.plot(steps, diagnostics["sampled_single_step_ap"])
     ax.set(xlabel="Timestep", ylabel="Sampled voxel AP", title="Validation diagnostic using lesion labels")
     ax = plots[2]
-    heat = ax.imshow(diagnostics["correlation"], extent=(74.5, 199.5, 199.5, 74.5),
-                     vmin=-1, vmax=1, cmap="coolwarm")
-    ax.set(xlabel="Timestep", ylabel="Timestep", title="Foreground log residual correlation")
+    correlation = np.asarray(diagnostics["correlation"])
+    off_diagonal = np.ma.array(correlation, mask=np.eye(len(steps), dtype=bool))
+    heat = ax.imshow(off_diagonal, extent=(74.5, 199.5, 199.5, 74.5), cmap="viridis")
+    ax.set(xlabel="Timestep", ylabel="Timestep", title="Foreground correlation across timesteps")
     fig.colorbar(heat, ax=ax, shrink=0.8)
     fig.savefig(OUTPUT / "diagnostics.png", dpi=180)
     plt.close(fig)
