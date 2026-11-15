@@ -1,13 +1,14 @@
 """Produce the BraTS21 E1 tables and figures from the completed run."""
 
 import json
+
 import matplotlib
 import numpy as np
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
-from experiments.e1 import ARCHIVE, BASE, BUDGETS, OUTPUT, RANDOM_SEEDS, archived
+from experiments.e1 import ARCHIVE, BASE, BUDGETS, OUTPUT, RANDOM_SEEDS, SHAPE, archived, saved_map
 
 
 def load(path):
@@ -51,10 +52,14 @@ def write_pareto(results, configs):
     plt.close(fig)
 
 
-def write_examples(results, configs):
+def write_examples(results, configs, embedded_baseline=False):
     # Use the first subject in the predeclared timing panel.
     subject = results["timing_subjects"][0]
-    baseline, truth = archived("test", subject)
+    if embedded_baseline:
+        baseline = saved_map(OUTPUT / "test", subject, "baseline")
+        truth = np.unpackbits(saved_map(OUTPUT / "test", subject, "label")).reshape(SHAPE).astype(bool)
+    else:
+        baseline, truth = archived("test", subject)
     section = truth.sum(axis=(0, 1)).argmax()
     fig, plots = plt.subplots(1, len(configs) + 1, figsize=(2.4 * (len(configs) + 1), 2.8),
                               layout="constrained")
@@ -70,14 +75,16 @@ def write_examples(results, configs):
     plt.close(fig)
 
 
-def main():
+def main(embedded_baseline=False):
     frozen = load(OUTPUT / "frozen.json")
     data = load(OUTPUT / "results.json")
     configs = {"baseline": BASE, **frozen["configs"]}
-    manifest = load(ARCHIVE["val"] / "manifest.json")
+    manifest = load(OUTPUT / "provenance.json" if embedded_baseline else ARCHIVE["val"] / "manifest.json")
+    hardware = manifest["hardware"] if embedded_baseline else "Apple M5 MPS"
+    backend = "CUDA" if embedded_baseline else "MPS"
     lines = [
         "# E1 BraTS21 timestep subset selection", "",
-        f"Apple M5 MPS, PyTorch {manifest['torch']}, frozen `pyramid/232_ema_ckpt.pt`.",
+        f"{hardware}, PyTorch {manifest['torch']}, frozen `pyramid/232_ema_ckpt.pt`.",
         f"Checkpoint SHA-256 `{manifest['checkpoint_sha256']}`.", "",
         f"Calibration used eight validation subjects for label-free residual correlations. "
         f"Selection used the remaining {len(frozen['validation_subjects'])} validation subjects, "
@@ -90,7 +97,7 @@ def main():
     validation = OUTPUT / "validation"
     design = load(validation / "design.json")["configs"]
     validation_metrics = {name: load(validation / "metrics" / f"{name}.json")
-                          for name in ("baseline", *design)}
+                          for name in dict.fromkeys(("baseline", *design))}
     for name, row in validation_metrics.items():
         lines.append(f"| {name} | {len(design.get(name, BASE))} | {row['auprc']:.6f} | {row['dice']:.6f} |")
     lines += ["", "| Random budget | AUPRC mean ± SD | Dice mean ± SD |", "|---:|---:|---:|"]
@@ -109,9 +116,9 @@ def main():
             lines.append(f"| {name} | {len(configs[name])} | {kernel} | {score['auprc']:.6f} | "
                          f"{score['delta_auprc']:+.6f} | {score['dice']:.6f} | "
                          f"{score['delta_dice']:+.6f} [{lo:+.6f}, {hi:+.6f}] | {score['ceiling_dice']:.6f} |")
-    lines += ["", "## Actual Apple M5 runs", "",
+    lines += ["", f"## Synchronized {backend} timing", "",
               f"Each method ran separately on the same {len(data['timing_subjects'])} predetermined test subjects. "
-              "Inference timing includes all slices, residual transfers and score aggregation. MPS synchronizes "
+              f"Inference timing includes all slices, residual transfers and score aggregation. {backend} synchronizes "
               "before and after every timed run. Total latency adds the same subject's preprocessing and noise "
               "state preparation. Both exclude offline median filtering, metric computation and cache I/O.", "",
               "| Config | Inference median [IQR] (s) | Inference speedup | Total median (s) | Total speedup |",
@@ -125,21 +132,31 @@ def main():
     lines += [
         "", "The random variability table varies subset-selection seeds with the evaluation noise fixed. "
         "The main comparison uses one matched evaluation-noise realization per subject.",
-        "", "The new-step caches under `results/cache/e1/` store individual timestep log residuals in the same "
+        "", "The new-step caches store individual timestep log residuals in the same "
         "centered float16 foreground format as the grouped archive, with packed brain/label masks and per-region "
         "statistics. Full-volume inference maps were retained separately for exact filtering and scoring.",
-        "", "## Commands", "", "```bash",
+    ]
+    if embedded_baseline:
+        lines += [
+            "", "## Reproduction", "",
+            f"Branch commit `{manifest['identity']['commit']}`. The CUDA run used a freshly evaluated "
+            "125-step CUDA baseline with noise matched within this experiment. See `kaggle/README.md` "
+            "at this commit for the staged CLI commands.",
+        ]
+    else:
+        lines += ["", "## Commands", "", "```bash",
         "git switch -c codex/brats21-e1 codex/brats21-mps-reproduction",
         "env PYTORCH_ENABLE_MPS_FALLBACK=0 OMP_NUM_THREADS=4 PYTHONDONTWRITEBYTECODE=1 caffeinate -i .venv/bin/python -u -m experiments.e1 verify",
         "env PYTORCH_ENABLE_MPS_FALLBACK=0 OMP_NUM_THREADS=4 PYTHONDONTWRITEBYTECODE=1 caffeinate -i .venv/bin/python -u -m experiments.e1 run",
         "env OMP_NUM_THREADS=4 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m experiments.e1_report",
-        "```", "", "- [Noise schedule, single-step AP and correlations](diagnostics.png)",
+        "```"]
+    lines += ["", "- [Noise schedule, single-step AP and correlations](diagnostics.png)",
         "- [Accuracy versus measured speedup](pareto_mf5.png)", "- [Example maps](example.png)", "",
     ]
     (OUTPUT / "report.md").write_text("\n".join(lines))
     write_diagnostics()
     write_pareto(data["results"], configs)
-    write_examples(data, frozen["configs"])
+    write_examples(data, frozen["configs"], embedded_baseline)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,12 @@ class Inference:
             conf["noise_steps"], conf["size"], conf["beta_start"], conf["beta_end"], self.device
         )
 
+    def synchronize(self):
+        torch.mps.synchronize()
+
+    def set_noise_state(self, state):
+        torch.mps.set_rng_state(state)
+
     def batches(self, volume):
         slices = ((volume[0] * 2) - 1).permute(3, 0, 1, 2).contiguous()
         return [batch.to(self.device) for batch in slices.split(BATCH)]
@@ -95,7 +101,7 @@ class Inference:
         return states
 
     def residual(self, images, step, state):
-        torch.mps.set_rng_state(state)
+        self.set_noise_state(state)
         t = torch.full((len(images),), step, dtype=torch.long, device=self.device)
         x_t, noise = self.diffusion.noise_images(images, t)
         prediction = self.model(x_t, t)
@@ -117,7 +123,7 @@ class Inference:
         offsets = {step: col for col, step in enumerate(steps)}
         columns = {key: [offsets[t] for t in ts] for key, ts in configs.items()}
         maps = {name: np.empty(SHAPE, np.float32) for name in configs}
-        torch.mps.synchronize()
+        self.synchronize()
         start = perf_counter()
         for batch_index, images in enumerate(batches):
             residuals = torch.empty((len(images), len(steps), *images.shape[1:]), device=self.device)
@@ -134,7 +140,7 @@ class Inference:
                 chosen = logs if len(cols) == len(steps) else logs[:, cols]
                 result = chosen.mean(dim=1).exp_().amax(dim=1).permute(1, 2, 0)
                 maps[name][:, :, first:last] = result.numpy()
-        torch.mps.synchronize()
+        self.synchronize()
         return maps, perf_counter() - start
 
 
@@ -300,13 +306,17 @@ def score_volume(scores, truth, low, high):
     return yen, threshold_dice(scores, truth, CEILING_THRESHOLDS)
 
 
-def score_config(directory, ids, split, name, kernel, executor, labels):
+def saved_map(directory, subject, name):
+    with np.load(directory / "maps" / f"{subject}.npz", allow_pickle=False) as saved:
+        return saved[name]
+
+
+def score_config(directory, ids, split, name, kernel, executor, labels, embedded_baseline=False):
     def read(subject):
-        if name == "baseline":
+        if name == "baseline" and not embedded_baseline:
             scores, _ = archived(split, subject)
         else:
-            with np.load(directory / "maps" / f"{subject}.npz", allow_pickle=False) as saved:
-                scores = saved[name]
+            scores = saved_map(directory, subject, name)
         return median_filter(scores, size=kernel) if kernel else scores
 
     scores = np.empty((len(ids), *SHAPE), dtype=np.float32)
@@ -322,7 +332,8 @@ def score_config(directory, ids, split, name, kernel, executor, labels):
     return result
 
 
-def infer_split(conf, inference, split, stage, subset, configs, panel=()):
+def infer_split(conf, inference, split, stage, subset, configs, panel=(), *, provenance=None):
+    embedded_baseline = provenance is not None
     directory = OUTPUT / stage
     paths = directory / "maps"
     paths.mkdir(parents=True, exist_ok=True)
@@ -339,11 +350,14 @@ def infer_split(conf, inference, split, stage, subset, configs, panel=()):
     step_dir = STEP_CACHE / split
     if new_steps:
         step_dir.mkdir(parents=True, exist_ok=True)
-        write_json(step_dir / "manifest.json", {
+        backend = provenance if embedded_baseline else {
             "checkpoint_sha256": json.loads((ARCHIVE[split] / "manifest.json").read_text())["checkpoint_sha256"],
-            "torch": str(torch.__version__), "device": "mps", "seed": conf["seed"], "batch": BATCH,
-            "subjects": list(subset), "steps": new_steps,
+            "torch": str(torch.__version__), "device": "mps",
             "rng": "legacy for 75–199; independent MPS seed by split-row, timestep and slice batch elsewhere",
+        }
+        write_json(step_dir / "manifest.json", {
+            **backend, "seed": conf["seed"], "batch": BATCH,
+            "subjects": list(subset), "steps": new_steps,
             "groups": "singleton per step; brain-only log residuals centered by goff (float32), stored in glog (float16)",
             "voxel_order": "S,H,W over packed H,W,S brain mask",
             "tcurve": "mean log residuals floored at 1e-30, for lesion, healthy-in-brain, and background",
@@ -361,13 +375,13 @@ def infer_split(conf, inference, split, stage, subset, configs, panel=()):
         volume, label = loader.dataset[index]
         truth = label.numpy()
         brain = volume.gt(0).any(dim=0).numpy()
-        if stage != "calibration" and split == "val":
+        if not embedded_baseline and stage != "calibration" and split == "val":
             with np.load(Path("results/cache/val") / f"{subject}.npz") as prior:
                 brain = np.unpackbits(prior["brain"]).reshape(SHAPE).astype(bool)
                 if not np.array_equal(np.packbits(truth), prior["label"]):
                     raise ValueError(f"Archived mask mismatch for {subject}")
         batches = inference.batches(volume.unsqueeze(0))
-        torch.mps.synchronize()
+        inference.synchronize()
         prep_seconds = perf_counter() - start
         states = inference.noise_states(batches, index)
         noise_setup_seconds = perf_counter() - start - prep_seconds
@@ -382,24 +396,26 @@ def infer_split(conf, inference, split, stage, subset, configs, panel=()):
             new.save()
         benchmarks = {}
         if subject in panel:
-            methods = [("baseline", BASE), *configs.items()]
+            methods = list(configs.items()) if embedded_baseline else [("baseline", BASE), *configs.items()]
             # Rotate order across panel subjects to reduce thermal/order bias.
             for method in np.roll(np.arange(len(methods)), panel.index(subject)):
                 name, ts = methods[method]
                 direct, inference_seconds = inference.predict(batches, states, index, {name: ts})
-                reference = archived(split, subject)[0] if name == "baseline" else maps[name]
+                reference = archived(split, subject)[0] if name == "baseline" and not embedded_baseline else maps[name]
                 np.testing.assert_allclose(direct[name], reference, rtol=1e-5, atol=1e-10)
                 benchmarks[name] = inference_seconds
-        write_npz(path, **maps)
+        if embedded_baseline and samples is None:
+            maps["label"] = np.packbits(truth)
+        write_npz(path, compressed=embedded_baseline, **maps)
         write_json(time_path, dict(subject=subject, inference_s=seconds, preprocessing_s=prep_seconds,
                                   noise_replay_setup_s=noise_setup_seconds, timings_s=benchmarks))
         print(f"{stage} {subject} ({index + 1}/{len(ids)}): {seconds:.2f} s", flush=True)
 
 
-def calibrate(conf, inference):
+def calibrate(conf, inference, *, provenance=None):
     ids = subject_ids(conf["path_to_csv"])
     subset = ids[:CALIBRATION_SIZE]
-    infer_split(conf, inference, "val", "calibration", subset, {"baseline": BASE})
+    infer_split(conf, inference, "val", "calibration", subset, {"baseline": BASE}, provenance=provenance)
     directory = OUTPUT / "calibration"
     log_samples, scores, truth = [], [], []
     for subject in subset:
@@ -424,8 +440,21 @@ def validate(conf, inference):
     configs, groups = candidates(inference, correlation)
     ids = subject_ids(conf["path_to_csv"])[CALIBRATION_SIZE:]
     infer_split(conf, inference, "val", "validation", ids, configs)
+    select_validation(ids, configs, groups)
+
+
+def split_labels(directory, ids, split, embedded_baseline):
+    if not embedded_baseline:
+        return np.stack([archived(split, subject)[1] for subject in ids])
+    labels = np.empty((len(ids), *SHAPE), dtype=bool)
+    for i, subject in enumerate(ids):
+        labels[i] = np.unpackbits(saved_map(directory, subject, "label")).reshape(SHAPE)
+    return labels
+
+
+def select_validation(ids, configs, groups, *, embedded_baseline=False):
     directory = OUTPUT / "validation"
-    labels = np.stack([archived("val", subject)[1] for subject in ids])
+    labels = split_labels(directory, ids, "val", embedded_baseline)
     results_dir = directory / "metrics"
     results_dir.mkdir(exist_ok=True)
     scores = {}
@@ -433,7 +462,7 @@ def validate(conf, inference):
         for name in ("baseline", *configs):
             path = results_dir / f"{name}.json"
             if not path.exists():
-                write_json(path, score_config(directory, ids, "val", name, 5, executor, labels))
+                write_json(path, score_config(directory, ids, "val", name, 5, executor, labels, embedded_baseline))
             scores[name] = json.loads(path.read_text())
     winners = {
         family: max(names, key=lambda name: (scores[name]["auprc"], scores[name]["dice"]))
@@ -463,9 +492,13 @@ def test():
     panel = [ids[i] for i in np.linspace(0, len(ids) - 1, TIMING_PANEL_SIZE, dtype=int)]
     configs = frozen["configs"]
     infer_split(conf, inference, "test", "test", ids, configs, panel)
+    score_test(ids, configs, panel)
+
+
+def score_test(ids, configs, panel, *, embedded_baseline=False):
     directory = OUTPUT / "test"
     times = [json.loads((directory / f"{subject}.json").read_text()) for subject in panel]
-    labels = np.stack([archived("test", subject)[1] for subject in ids])
+    labels = split_labels(directory, ids, "test", embedded_baseline)
     results = {}
     with ThreadPoolExecutor(max_workers=6) as executor:
         for name in ("baseline", *configs):
@@ -473,7 +506,7 @@ def test():
             for kernel in FILTERS:
                 path = directory / f"{name}_mf{kernel}.json"
                 if not path.exists():
-                    write_json(path, score_config(directory, ids, "test", name, kernel, executor, labels))
+                    write_json(path, score_config(directory, ids, "test", name, kernel, executor, labels, embedded_baseline))
                 results[name][kernel] = json.loads(path.read_text())
                 result = results[name][kernel]
                 baseline = results["baseline"][kernel]
