@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--kernel-source", action="append", default=[])
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--repo", default="https://github.com/ahmad-m-abbas/ANDi.git")
-    parser.add_argument("--branch", default="codex/stack-04-e1")
+    parser.add_argument("--branch", default="codex/stack-05-e3")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int)
     args = parser.parse_args()
