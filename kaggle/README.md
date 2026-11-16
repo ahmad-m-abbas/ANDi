@@ -7,7 +7,7 @@ The jobs run in Kaggle after `kaggle kernels push` returns. All inference uses t
 1. Push the branch to GitHub and keep the same checkout for preparing every job.
 
    ```bash
-   git push -u origin codex/stack-04-e1
+   git push -u origin codex/stack-05-e3
    ```
 
 2. Use the private [Kaggle Model version](https://www.kaggle.com/models/ahmadabbas176/232-ema-ckpt-pt/PyTorch/default/1) as the checkpoint input. The runner checks the SHA-256 before loading it. The MRI input defaults to [BraTS 2021 Task 1](https://www.kaggle.com/datasets/dschettler8845/brats-2021-task1). The launcher accepts the extracted NIfTI folders or a mounted training tar and checks that all five files exist for each assigned subject.
@@ -49,7 +49,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 PROBE = True
-branch = "codex/stack-04-e1"
+branch = "codex/stack-05-e3"
 with TemporaryDirectory() as work:
     repo = Path(work) / "ANDi"
     subprocess.run(["git", "clone", "--single-branch", "--branch", branch,

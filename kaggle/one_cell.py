@@ -24,7 +24,7 @@ def full(commit, probe=False):
     saved.mkdir(parents=True, exist_ok=True)
     settings = {
         "repo": "https://github.com/ahmad-m-abbas/ANDi.git",
-        "branch": "codex/stack-04-e1",
+        "branch": "codex/stack-05-e3",
         "kernel_sources": [],
         "identity": {
             "commit": commit,
