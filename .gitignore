@@ -1,0 +1,47 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Python environments, bytecode, and tooling caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+/build/
+/dist/
+.ipynb_checkpoints/
+
+# Credentials and local configuration (keep shareable templates)
+.env
+.env.*
+!.env.example
+!.env.template
+.netrc
+kaggle.json
+
+# Local MRI data and generated experiment outputs
+# Root-anchored so andi/data/ and tracked split/config files remain visible.
+/data/
+/results/
+/Kaggle-output/
+
+# Downloaded weights and training checkpoints
+/pyramid/
+/models/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# W&B offline runs and local artifact caches
+wandb/
+.wandb/
+/artifacts/
