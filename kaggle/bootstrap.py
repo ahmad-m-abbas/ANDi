@@ -102,14 +102,18 @@ def stage_data(root, ids, destination):
     raise FileNotFoundError(f"Missing {len(names)} required BraTS21 NIfTI files, e.g. {sorted(names)[:5]}")
 
 
+def install_missing_dependencies():
+    required = ("lmdb", "nibabel", "accelerate", "numba")
+    missing = [package for package in required if importlib.util.find_spec(package) is None]
+    if missing:
+        subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=True)
+
+
 def main(settings, *, output_path=OUTPUT, local_inputs=(), staged_data=None, gpu=None, extra_args=()):
     with TemporaryDirectory(prefix="andi-e1-") as work:
         repo = Path(work) / "ANDi"
         checkout(settings, repo)
-        required = ("lmdb", "nibabel", "accelerate", "numba")
-        missing = [package for package in required if importlib.util.find_spec(package) is None]
-        if missing:
-            subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=True)
+        install_missing_dependencies()
         output = Path(work) / "artifacts"
         stage = settings["stage"]
         command = [

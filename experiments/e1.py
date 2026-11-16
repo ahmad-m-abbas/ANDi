@@ -301,12 +301,15 @@ class NewStepCache:
         )
 
 
-def score_volume(scores, truth, low, high):
+def score_volume(scores, truth, low, high, normal=None):
     scores -= low
     scores /= high - low
     pred = binary_dilation(scores > threshold_yen(scores), structure=DILATION)
     yen = 2 * (pred & truth).sum() / (pred.sum() + truth.sum())
-    return yen, threshold_dice(scores, truth, CEILING_THRESHOLDS)
+    result = yen, threshold_dice(scores, truth, CEILING_THRESHOLDS)
+    if normal is not None:
+        return (*result, float(np.count_nonzero(pred & normal) / normal.sum()))
+    return result
 
 
 def saved_map(directory, subject, name):
@@ -314,7 +317,7 @@ def saved_map(directory, subject, name):
         return saved[name]
 
 
-def score_config(directory, ids, split, name, kernel, executor, labels, embedded_baseline=False):
+def score_config(directory, ids, split, name, kernel, executor, labels, embedded_baseline=False, normal=None):
     def read(subject):
         if name == "baseline" and not embedded_baseline:
             scores, _ = archived(split, subject)
@@ -327,10 +330,18 @@ def score_config(directory, ids, split, name, kernel, executor, labels, embedded
         scores[row] = filtered
     low, high = float(scores.min()), float(scores.max())
     fn = partial(score_volume, low=low, high=high)
-    yen, ceiling = zip(*executor.map(fn, scores, labels))
+    if normal is None:
+        yen, ceiling = zip(*executor.map(fn, scores, labels))
+    else:
+        def score_with_normal(scores, truth, mask):
+            return fn(scores, truth, normal=mask)
+        yen, ceiling, fpr = zip(*executor.map(score_with_normal, scores, labels, normal))
     ap = pooled_average_precision(torch.from_numpy(scores), torch.from_numpy(labels))
     result = dict(auprc=ap, dice=float(np.mean(yen)), ceiling_dice=float(np.mean(ceiling, axis=0).max()),
                   subject_dice=list(yen))
+    if normal is not None:
+        result.update(nonlesion_fpr=float(np.mean(fpr)), subject_nonlesion_fpr=list(fpr),
+                      score_min=low, score_max=high)
     print(f"{split} MF{kernel} {name}: AP={ap:.6f} Dice={result['dice']:.6f}", flush=True)
     return result
 
