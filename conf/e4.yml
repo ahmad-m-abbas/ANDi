@@ -1,0 +1,12 @@
+# Overrides and extra settings for the separate E4 trainer.
+# Other model, diffusion, optimizer schedule and EMA defaults come from train.yml.
+epochs: 10
+batch_size: 2
+variant: consistency
+consistency_lambda: 0.1
+augmentation_type: gamma
+augmentation_magnitude: 0.15
+seed: 2026
+shuffle_seed: 2027
+augmentation_seed: 2028
+validation_seed: 2029
