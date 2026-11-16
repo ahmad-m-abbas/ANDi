@@ -71,3 +71,34 @@ This code is based on @dome272 implementation of DDPM's https://github.com/dome2
 &nbsp;
 
 All baseline implementations can be found in the [baselines folder](baselines)
+
+## Code organization and compatibility
+
+Run the commands above from the repository root. The root `train.py`, `eval.py`,
+`modules.py`, `diffusion.py`, and `utils.py` retain their historical imports and
+entry points and forward to the implementations below.
+
+| Location | Existing responsibility |
+| --- | --- |
+| `andi/models/unet.py` | U-Net, EMA and learning-rate scheduler |
+| `andi/diffusion/process.py` | Diffusion training, sampling and normative residuals |
+| `andi/diffusion/noise.py` | Gaussian pyramid/coarse noise and existing tensor transforms |
+| `andi/data/loading.py` | LMDB slices, MRI volumes and preprocessing |
+| `andi/training/train.py` | Training loop, MSE reporting, existing W&B calls, checkpoint save/resume |
+| `andi/training/images.py` | Training image display/save/upload |
+| `andi/evaluation/evaluate.py` | Published evaluation entry point, checkpoint loading and CSV reporting |
+| `andi/evaluation/metrics.py` | Existing Dice implementations |
+| `andi/evaluation/postprocessing.py` | Filtering, dilation, normalization and geometric aggregation |
+| `andi/checkpoints/paths.py` | Existing `make_dicts` output-directory creation |
+| `andi/utils.py` | Compatibility exports for the former utility module |
+| `prepare_data.py`, `split_healthy.py`, `registrator.py` | Original data preparation commands |
+| `baselines/`, `conf/`, `splits/` | Comparison methods, settings and fixed subject lists |
+
+Checkpoint serialization stays at its existing call sites: training writes raw
+model, optimizer and EMA state dictionaries to
+`models/<run_name>/<epoch>_ckpt.pt`, `<epoch>_optim.pt` and
+`<epoch>_ema_ckpt.pt`. Resume reads `model`, `opt` and `ema` from
+`conf/train.yml`; evaluation reads `model` from `conf/eval.yml`. Parameter keys,
+architecture and configuration values are unchanged. No new checkpoint API or
+W&B integration is included. Existing W&B logging remains in the training loop
+for later integration work.
