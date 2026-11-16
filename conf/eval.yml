@@ -9,8 +9,8 @@ batch_size : 1  # number of volumes load into the gpu
 size_splits: 155  # number of slices processed in gpu for each volume at the same time
 workers : 2  # cpu data loaders
 seed : 73
-output : "./results/ANDi.csv"
-output_mf : "./results/ANDi_mf.csv"
+output : "./results/brats21-mps/ANDi.csv"
+output_mf : "./results/brats21-mps/ANDi_mf.csv"
 
 # params for optimal dice calculation
 thr_start: 0.01
@@ -32,7 +32,7 @@ max: True
 #
 # Model Hyperparameters
 #
-model : 
+model : "./pyramid/232_ema_ckpt.pt"
 size : 128
 channels : 4
 
