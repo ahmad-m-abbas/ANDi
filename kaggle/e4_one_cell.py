@@ -14,9 +14,13 @@ import sys
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
-# Allow direct execution from the repository root, as in the existing runners.
+if __package__:
+    from . import bootstrap
+else:
+    # The notebook executes this file directly, with its directory on sys.path.
+    import bootstrap
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kaggle import bootstrap
 
 BRATS = "dschettler8845/brats-2021-task1"
 CHECKPOINT = "ahmadabbas176/232-ema-ckpt-pt/pytorch/default/1"
