@@ -23,13 +23,17 @@ def intensity_transform(images, magnitude, generator):
     return torch.where(images > 0, transformed, images)
 
 
-def objective(model, diffusion, images, config, augmentation_rng):
-    original = images * 2 - 1
-    timesteps = diffusion.sample_timesteps(images.shape[0]).to(images.device)
+def diffusion_batch(diffusion, images, config):
+    timesteps = diffusion.sample_timesteps(len(images)).to(images.device)
     noisy, noise = diffusion.noise_images(
-        original, timesteps, pyramid=config["pyramid"],
+        images * 2 - 1, timesteps, pyramid=config["pyramid"],
         simplex=config["simplex"], discount=config["discount"],
     )
+    return noisy, noise, timesteps
+
+
+def objective(model, diffusion, images, inputs, config, augmentation_rng):
+    noisy, noise, timesteps = inputs
     prediction = model(noisy, timesteps)
     original_mse = F.mse_loss(prediction, noise)
     if config["variant"] == "baseline":
@@ -88,7 +92,9 @@ class Trainer:
         self.ema_model = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.ema = EMA(config["ema_decay"])
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1)
-        self.batches = math.ceil(len(training) / config["batch_size"])
+        self.batch_size = config["batch_size"]
+        self.microbatch_size = config.get("microbatch_size", self.batch_size)
+        self.batches = math.ceil(len(training) / self.batch_size)
         self.total_steps = self.batches * config["epochs"]
         warmup = max(1, int(config["warmup_steps"] * self.total_steps))
         if warmup >= self.total_steps:
@@ -146,23 +152,35 @@ class Trainer:
             order_rng = torch.Generator().manual_seed(self.config["shuffle_seed"] + self.epoch)
             self.order = torch.randperm(len(self.training), generator=order_rng)
             self.order_epoch = self.epoch
-        start = self.batch * self.config["batch_size"]
-        indices = self.order[start:start + self.config["batch_size"]]
+        start = self.batch * self.batch_size
+        indices = self.order[start:start + self.batch_size]
         images = torch.stack([self.training[int(index)] for index in indices]).to(self.device)
+        # Pyramidal noise is normalized across the full logical batch before slicing.
+        inputs = diffusion_batch(self.diffusion, images, self.config)
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        loss, components = objective(
-            self.model, self.diffusion, images, self.config, self.augmentation_rng
-        )
-        if not torch.isfinite(loss):
+        totals = images.new_zeros(3)
+        for start in range(0, len(images), self.microbatch_size):
+            part = slice(start, start + self.microbatch_size)
+            microbatch = images[part]
+            loss, components = objective(
+                self.model, self.diffusion, microbatch, tuple(value[part] for value in inputs),
+                self.config, self.augmentation_rng,
+            )
+            weight = len(microbatch) / len(images)
+            (loss * weight).backward()
+            totals += weight * torch.stack((
+                loss.detach(), components["ddpm"].detach(), components["consistency"].detach(),
+            ))
+        loss_value, ddpm, consistency = totals.tolist()
+        if not math.isfinite(loss_value):
             raise ValueError("Nonfinite training loss")
-        loss.backward()
         self.optimizer.step()
         self.scheduler.step()
         self.ema.step_ema(self.ema_model, self.model)
         self.global_step += 1
         self.batch += 1
-        return {"loss": loss.item(), **{key: value.item() for key, value in components.items()},
+        return {"loss": loss_value, "ddpm": ddpm, "consistency": consistency,
                 "lr": self.scheduler.get_last_lr()[0]}
 
     @torch.no_grad()
@@ -172,16 +190,18 @@ class Trainer:
         try:
             seed_all(self.config["validation_seed"])
             total = 0.
-            for start in range(0, len(self.validation), self.config["batch_size"]):
+            for start in range(0, len(self.validation), self.batch_size):
                 images = torch.stack([
                     self.validation[index]
-                    for index in range(start, min(start + self.config["batch_size"], len(self.validation)))
-                ]).to(self.device) * 2 - 1
-                t = self.diffusion.sample_timesteps(len(images)).to(self.device)
-                noisy, noise = self.diffusion.noise_images(
-                    images, t, pyramid=True, discount=self.config["discount"]
-                )
-                total += F.mse_loss(self.ema_model(noisy, t), noise).item() * len(images)
+                    for index in range(start, min(start + self.batch_size, len(self.validation)))
+                ]).to(self.device)
+                noisy, noise, timesteps = diffusion_batch(self.diffusion, images, self.config)
+                squared_error = images.new_zeros(())
+                for offset in range(0, len(images), self.microbatch_size):
+                    part = slice(offset, offset + self.microbatch_size)
+                    prediction = self.ema_model(noisy[part], timesteps[part])
+                    squared_error += F.mse_loss(prediction, noise[part], reduction="sum")
+                total += squared_error.item() / images[0].numel()
             score = total / len(self.validation)
             if not math.isfinite(score):
                 raise ValueError("Nonfinite validation loss")

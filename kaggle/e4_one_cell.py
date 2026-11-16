@@ -44,9 +44,10 @@ def prepare(repo, source, work, split, smoke):
     # Sparse virtual map, sized above the maximum 155 slices per training subject.
     map_size = max(64 * 1024**2, len(subjects) * 155 * 4 * 128 * 128 * 4 * 2)
     resize = transforms.Resize(128, antialias=True)
+    slice_limit = {"train": 8, "val": 4}[split] if smoke else None
     with lmdb.open(str(destination), map_size=map_size) as env:
         for subject in subjects:
-            indices, images = healthy_slice_batch(staged, subject, resize, 4 if smoke else None)
+            indices, images = healthy_slice_batch(staged, subject, resize, slice_limit)
             if images is not None:
                 if not np.isfinite(images).all():
                     raise ValueError(f"Nonfinite input from {subject}")
@@ -197,12 +198,16 @@ def main(args):
             if not 0 <= config["consistency_lambda"] < math.inf:
                 raise ValueError("Consistency weight must be nonnegative and finite")
             if args.smoke:
-                config.update(epochs=1, batch_size=1, warmup_steps=0.25)
+                config.update(epochs=1, batch_size=2, microbatch_size=1, warmup_steps=0.25)
             else:
                 if args.epochs is not None:
                     config["epochs"] = args.epochs
                 if args.batch_size is not None:
                     config["batch_size"] = args.batch_size
+                if args.microbatch_size is not None:
+                    config["microbatch_size"] = args.microbatch_size
+                if config["microbatch_size"] > config["batch_size"]:
+                    raise ValueError("Microbatch size must be at most the effective batch size")
             if config["augmentation_type"] != "gamma" or not 0 <= config["augmentation_magnitude"] < 1:
                 raise ValueError("E4 uses gamma augmentation with magnitude in [0, 1)")
             commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
@@ -289,7 +294,8 @@ if __name__ == "__main__":
     parser.add_argument("--initialize", action="store_true")
     parser.add_argument("--resume", help="Trusted entity/project/collection:verified or :vN")
     parser.add_argument("--epochs", type=int)
-    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--batch-size", type=int, help="Effective batch size per optimizer update")
+    parser.add_argument("--microbatch-size", type=int, help="Slices processed together on device")
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--save-seconds", type=float, default=600)
     parser.add_argument("--data", type=Path, help="Local extracted BraTS21 root for developer smoke checks")
@@ -298,6 +304,7 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     if arguments.save_steps < 1 or not 0 < arguments.save_seconds < math.inf:
         parser.error("Checkpoint step and time intervals must be positive and finite")
-    if any(value is not None and value < 1 for value in (arguments.epochs, arguments.batch_size)):
-        parser.error("Epochs and batch size must be positive")
+    if any(value is not None and value < 1
+           for value in (arguments.epochs, arguments.batch_size, arguments.microbatch_size)):
+        parser.error("Epochs and batch sizes must be positive")
     main(arguments)

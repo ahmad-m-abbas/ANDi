@@ -1,7 +1,8 @@
 # Overrides and extra settings for the separate E4 trainer.
 # Other model, diffusion, optimizer schedule and EMA defaults come from train.yml.
-epochs: 10
-batch_size: 2
+epochs: 232  # ANDi paper, Appendix A
+batch_size: 128
+microbatch_size: 2
 variant: consistency
 consistency_lambda: 0.1
 augmentation_type: gamma

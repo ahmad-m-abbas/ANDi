@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from andi.diffusion.process import Diffusion
-from andi.training.e4 import Trainer, intensity_transform, objective, seed_all
+from andi.training.e4 import Trainer, diffusion_batch, intensity_transform, objective, seed_all
 from andi.training.e4_checkpoints import CheckpointStore, atomic_save
 
 
@@ -53,7 +53,7 @@ class E4Tests(unittest.TestCase):
         images = torch.rand(2, 4, 16, 16)
         rng = torch.Generator().manual_seed(4)
         before = rng.get_state()
-        loss, terms = objective(model, diffusion, images, config, rng)
+        loss, terms = objective(model, diffusion, images, diffusion_batch(diffusion, images, config), config, rng)
         original, t = model.calls[0]
         augmented, other_t = model.calls[1]
         self.assertTrue(torch.equal(t, other_t))
@@ -81,25 +81,47 @@ class E4Tests(unittest.TestCase):
         expected = torch.nn.functional.mse_loss(model(noisy, t), noise)
         model.calls.clear()
         seed_all(9)
-        actual, _ = objective(model, diffusion, images, config, torch.Generator())
+        actual, _ = objective(
+            model, diffusion, images, diffusion_batch(diffusion, images, config), config, torch.Generator()
+        )
         self.assertTrue(torch.equal(expected, actual))
         self.assertEqual(len(model.calls), 1)
 
     def test_augmentation_control_has_zero_consistency_weight(self):
         config = self.config() | {"variant": "augmentation", "consistency_lambda": 0.}
         model = TinyModel()
+        diffusion = Diffusion(1000, 16, 0.0001, 0.02, "cpu")
+        images = torch.rand(2, 4, 16, 16)
         loss, terms = objective(
-            model, Diffusion(1000, 16, 0.0001, 0.02, "cpu"),
-            torch.rand(2, 4, 16, 16), config, torch.Generator()
+            model, diffusion, images, diffusion_batch(diffusion, images, config), config, torch.Generator()
         )
         self.assertTrue(torch.equal(loss, terms["ddpm"]))
         self.assertEqual(len(model.calls), 2)
 
     @patch("andi.training.e4.UNet", TinyModel)
+    def test_accumulation_matches_whole_batch_with_uneven_microbatches(self):
+        config = self.config() | {"batch_size": 5}
+        data = torch.rand(8, 4, 16, 16)
+        combined = Trainer(config | {"microbatch_size": 5}, data, data[:3], "cpu")
+        combined_losses = [combined.step(), combined.step()]
+        accumulated = Trainer(config | {"microbatch_size": 2}, data, data[:3], "cpu")
+        accumulated_losses = [accumulated.step(), accumulated.step()]
+        for expected, actual in zip(combined_losses, accumulated_losses):
+            for key in expected:
+                self.assertAlmostEqual(expected[key], actual[key], places=5)
+        torch.testing.assert_close(combined.model.scale, accumulated.model.scale)
+        for key in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(combined.optimizer.state[combined.model.scale][key],
+                                       accumulated.optimizer.state[accumulated.model.scale][key])
+        self.assertEqual(accumulated.global_step, 2)
+        self.assertEqual(accumulated.ema.step, 2)
+        self.assertEqual(combined.scheduler.state_dict(), accumulated.scheduler.state_dict())
+
+    @patch("andi.training.e4.UNet", TinyModel)
     def test_mid_epoch_and_epoch_resume(self):
         from kaggle.e4_one_cell import assert_same
 
-        config = self.config()
+        config = self.config() | {"microbatch_size": 1}
         data = torch.rand(6, 4, 16, 16)
         trainer = Trainer(config, data, data[:2], "cpu")
         trainer.step()
