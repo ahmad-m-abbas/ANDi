@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pickle
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -129,6 +130,12 @@ def smoke_resume(trainer, store, remote, config, training, validation, device, r
 
 def main(args):
     repo = Path(__file__).resolve().parents[1]
+    commit = args.source_commit
+    if commit is None:
+        if shutil.which("git") is None:
+            raise RuntimeError("Pass --source-commit with the full Git SHA from the login node")
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    print(f"Source commit: {commit}", flush=True)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     bootstrap.install_missing_dependencies()
     import numpy as np
@@ -214,7 +221,6 @@ def main(args):
                     raise ValueError("Microbatch size must be at most the effective batch size")
             if config["augmentation_type"] != "gamma" or not 0 <= config["augmentation_magnitude"] < 1:
                 raise ValueError("E4 uses gamma augmentation with magnitude in [0, 1)")
-            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
             initial_weights = None
             initialization = {"mode": "fresh"}
             if saved:
@@ -297,6 +303,7 @@ if __name__ == "__main__":
     parser.add_argument("--consistency-lambda", type=float)
     parser.add_argument("--initialize", action="store_true")
     parser.add_argument("--resume", help="Trusted entity/project/collection:verified or :vN")
+    parser.add_argument("--source-commit", help="Full Git SHA of the checkout, for nodes without Git")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int, help="Effective batch size per optimizer update")
     parser.add_argument("--microbatch-size", type=int, help="Slices processed together on device")
@@ -306,6 +313,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=Path("/kaggle/working/andi-e4"))
     parser.add_argument("--local-only", action="store_true", help="Explicit local smoke check without durability")
     arguments = parser.parse_args()
+    if arguments.source_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", arguments.source_commit):
+        parser.error("--source-commit requires the full 40-character Git SHA")
     if arguments.save_steps < 1 or not 0 < arguments.save_seconds < math.inf:
         parser.error("Checkpoint step and time intervals must be positive and finite")
     if any(value is not None and value < 1
