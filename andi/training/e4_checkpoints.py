@@ -52,8 +52,8 @@ class WandbCheckpoints:
         return artifact, checkpoint
 
     def recover(self, ref):
-        if not re.fullmatch(r"[^/]+/[^/]+/[^/:]+:(?:verified|v[0-9]+)", ref):
-            raise ValueError("Use entity/project/collection:verified or an explicit :vN")
+        if not re.fullmatch(r"[^/]+/[^/]+/[^/:]+:(?:verified|v[0-9]+|best-step-[0-9]+)", ref):
+            raise ValueError("Use entity/project/collection with :verified, :vN or :best-step-N")
         with TemporaryDirectory() as work:
             artifact, checkpoint = self.download(ref, work)
             if f"verified-{artifact.version}" not in artifact.aliases:

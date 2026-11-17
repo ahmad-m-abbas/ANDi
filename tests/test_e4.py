@@ -149,6 +149,40 @@ class E4Tests(unittest.TestCase):
             replay.restore(snapshot | {"config": config | {"seed": 99}})
 
     @patch("andi.training.e4.UNet", TinyModel)
+    def test_migration_restores_training_state_across_backend_and_commit(self):
+        from kaggle.e4_one_cell import assert_same
+
+        config = self.config() | {
+            "backend": {"device": "source"},
+            "identity": {"commit": "original", "train": {"tensor_sha256": "fixed"}},
+        }
+        data = torch.rand(6, 4, 16, 16)
+        source = Trainer(config, data, data[:2], "cpu")
+        source.step()
+        checkpoint = copy.deepcopy(source.snapshot())
+        source.step()
+        expected = copy.deepcopy(source.snapshot())
+
+        destination_config = config | {
+            "backend": {"device": "destination"},
+            "identity": config["identity"] | {"commit": "updated"},
+        }
+        destination = Trainer(destination_config, data, data[:2], "cpu")
+        with self.assertRaisesRegex(ValueError, "Exact resume"):
+            destination.restore(checkpoint)
+        changed_data = checkpoint["config"]["identity"] | {"train": {"tensor_sha256": "different"}}
+        incompatible = checkpoint | {"config": config | {"identity": changed_data}}
+        with self.assertRaisesRegex(ValueError, "prepared-data fingerprints"):
+            destination.restore(incompatible, allow_runtime_change=True)
+        incompatible = checkpoint | {"config": config | {"consistency_lambda": 0.5}}
+        with self.assertRaisesRegex(ValueError, "training settings"):
+            destination.restore(incompatible, allow_runtime_change=True)
+
+        destination.restore(checkpoint, allow_runtime_change=True)
+        destination.step()
+        assert_same(expected | {"config": destination_config}, destination.snapshot())
+
+    @patch("andi.training.e4.UNet", TinyModel)
     def test_resume_from_last_batch_before_validation(self):
         config = self.config() | {"epochs": 1}
         data = torch.rand(6, 4, 16, 16)

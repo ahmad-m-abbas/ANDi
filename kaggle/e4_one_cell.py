@@ -143,15 +143,13 @@ def main(args):
     import torch
     import torchvision
     import yaml
-    from andi.training.e4 import Trainer
-    from andi.training.e4_checkpoints import CheckpointStore, WandbCheckpoints, sha256
+    from andi.training.e4 import Trainer, same_training_config
+    from andi.training.e4_checkpoints import CheckpointStore, WandbCheckpoints, atomic_save, sha256
 
     if args.local_only and not args.smoke:
         raise ValueError("--local-only is restricted to smoke checks")
     if not args.local_only and (not args.entity or not args.project):
         raise ValueError("W&B entity and project are required for durable checkpoints")
-    if args.resume and args.initialize:
-        raise ValueError("Choose exact resume or pretrained initialization")
     if not args.local_only:
         bootstrap.install_missing_dependencies(("wandb",))
     if not args.local_only and not args.data and not torch.cuda.is_available():
@@ -182,9 +180,13 @@ def main(args):
         run.define_metric("global_step")
         run.define_metric("*", step_metric="global_step")
     try:
-        remote = WandbCheckpoints(run, args.collection) if run and not args.filesystem_checkpoints else None
+        wandb_checkpoints = WandbCheckpoints(run, args.collection) if run else None
+        remote = None if args.filesystem_checkpoints else wandb_checkpoints
         saved = None
         resolved = None
+        requested = args.migrate_from_wandb or args.resume or (
+            str(args.resume_local) if args.resume_local else None
+        )
         if args.resume_local:
             checkpoint = args.resume_local.resolve(strict=True)
             # Full E4 checkpoints contain pickled RNG state. Use only trusted files.
@@ -197,6 +199,11 @@ def main(args):
             if not args.resume.startswith(prefix):
                 raise ValueError("Resume must use the same entity/project/collection")
             resolved, saved = remote.recover(args.resume)
+        elif args.migrate_from_wandb:
+            if not args.migrate_from_wandb.startswith(f"{args.entity}/{args.project}/"):
+                raise ValueError("Migrate from a verified artifact in the configured W&B project")
+            resolved, saved = wandb_checkpoints.recover(args.migrate_from_wandb)
+            print(f"Loaded {resolved} for migration at step {saved['global_step']}", flush=True)
 
         with TemporaryDirectory(prefix="andi-e4-") as temporary:
             work = Path(temporary)
@@ -255,30 +262,38 @@ def main(args):
                 config.pop(key, None)
             (output / "configuration.json").write_text(json.dumps(config, indent=2) + "\n")
             (output / "resume.json").write_text(json.dumps(
-                {"requested": str(args.resume_local) if args.resume_local else args.resume,
-                 "resolved": resolved, "checkpoint_storage": "wandb" if remote else "filesystem",
+                {"requested": requested, "resolved": resolved,
+                 "migrated_runtime": bool(args.migrate_from_wandb),
+                 "source_backend": saved["config"]["backend"] if saved else None,
+                 "checkpoint_storage": "wandb" if remote else "filesystem",
                  "save_steps": args.save_steps, "save_seconds": args.save_seconds}, indent=2) + "\n")
             if run:
                 run.config.update(config | {"resume_artifact": resolved,
+                                            "migrated_runtime": bool(args.migrate_from_wandb),
+                                            "source_backend": saved["config"]["backend"] if saved else None,
                                             "checkpoint_storage": "wandb" if remote else "filesystem",
                                             "save_steps": args.save_steps,
                                             "save_seconds": args.save_seconds})
             trainer = Trainer(config, training, validation, device, initial_weights)
             store = CheckpointStore(output / "checkpoints", remote)
             if saved:
-                trainer.restore(saved)
-                if args.resume_local and trainer.best_step is not None:
-                    previous_best = (
-                        checkpoint if trainer.best_step == trainer.global_step
-                        else checkpoint.with_name("best.pt")
-                    )
-                    best = torch.load(previous_best, map_location="cpu", weights_only=False)
-                    if (best["config"] != config or best["global_step"] != trainer.best_step
+                trainer.restore(saved, allow_runtime_change=bool(args.migrate_from_wandb))
+                if args.filesystem_checkpoints and trainer.best_step is not None:
+                    if trainer.best_step == trainer.global_step:
+                        best = saved
+                    elif args.migrate_from_wandb:
+                        origin = resolved.rsplit(":", 1)[0]
+                        _, best = wandb_checkpoints.recover(f"{origin}:best-step-{trainer.best_step}")
+                    else:
+                        best = torch.load(checkpoint.with_name("best.pt"), map_location="cpu", weights_only=False)
+                    if (not same_training_config(best["config"], config) or best["global_step"] != trainer.best_step
                             or best["best_validation"] != trainer.best_validation):
-                        raise ValueError("The saved best.pt differs from the checkpoint's validation selection")
-                    shutil.copyfile(previous_best, store.directory / "best.pt")
+                        raise ValueError("The saved best checkpoint differs from the recorded validation selection")
+                    atomic_save(best, store.directory / "best.pt")
                     del best
                 del saved
+                if args.migrate_from_wandb:
+                    trainer.save(store)
             if args.smoke and trainer.global_step == 0:
                 trainer = smoke_resume(trainer, store, remote, config, training, validation, device, run)
             else:
@@ -298,7 +313,9 @@ def main(args):
             else:
                 best = torch.load(best_path, map_location="cpu", weights_only=False)
                 selected_ref = str(best_path)
-            if (best["config"] != config or best["global_step"] != trainer.best_step
+            compatible = (best["config"] == config if remote
+                          else same_training_config(best["config"], config))
+            if (not compatible or best["global_step"] != trainer.best_step
                     or best["best_validation"] != trainer.best_validation):
                 raise ValueError("Best checkpoint differs from the recorded validation selection")
             torch.save(best["ema_model"], output / "selected_ema_ckpt.pt")
@@ -322,11 +339,14 @@ if __name__ == "__main__":
     parser.add_argument("--variant", choices=("baseline", "augmentation", "consistency"), default="consistency")
     parser.add_argument("--consistency-lambda", type=float)
     parser.add_argument("--initialize", action="store_true")
-    parser.add_argument("--resume", help="Trusted entity/project/collection:verified or :vN")
+    resume_options = parser.add_mutually_exclusive_group()
+    resume_options.add_argument("--resume", help="Trusted entity/project/collection:verified or :vN")
     parser.add_argument("--filesystem-checkpoints", action="store_true",
                         help="Keep checkpoints under --output and send metrics only to W&B")
-    parser.add_argument("--resume-local", type=Path,
-                        help="Resume a trusted filesystem checkpoint. Keep its sibling best.pt.")
+    resume_options.add_argument("--resume-local", type=Path,
+                               help="Resume a trusted filesystem checkpoint. Keep its sibling best.pt.")
+    resume_options.add_argument("--migrate-from-wandb",
+                               help="Continue a verified W&B checkpoint on a compatible new runtime")
     parser.add_argument("--source-commit", help="Full Git SHA of the checkout, for nodes without Git")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int, help="Effective batch size per optimizer update")
@@ -337,8 +357,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=Path("/kaggle/working/andi-e4"))
     parser.add_argument("--local-only", action="store_true", help="Explicit local smoke check without durability")
     arguments = parser.parse_args()
-    if arguments.resume_local and (arguments.resume or arguments.initialize or not arguments.filesystem_checkpoints):
-        parser.error("--resume-local requires --filesystem-checkpoints and cannot be combined with --resume or --initialize")
+    if arguments.initialize and (arguments.resume or arguments.resume_local or arguments.migrate_from_wandb):
+        parser.error("Choose pretrained initialization or continuation from a checkpoint")
+    if (arguments.resume_local or arguments.migrate_from_wandb) and not arguments.filesystem_checkpoints:
+        parser.error("--resume-local and --migrate-from-wandb require --filesystem-checkpoints")
+    if arguments.migrate_from_wandb and arguments.local_only:
+        parser.error("--migrate-from-wandb requires online W&B access")
     if arguments.resume and arguments.filesystem_checkpoints:
         parser.error("--resume requires W&B checkpoint storage. Use --resume-local for filesystem checkpoints.")
     if arguments.source_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", arguments.source_commit):

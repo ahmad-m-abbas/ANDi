@@ -76,6 +76,19 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def same_training_config(left, right):
+    """Compare training and dataset identity across a runtime or source change."""
+    def training_fields(config):
+        identity = config.get("identity", {})
+        return {
+            key: ({name: value for name, value in identity.items() if name != "commit"}
+                  if key == "identity" else value)
+            for key, value in config.items() if key != "backend"
+        }
+
+    return training_fields(left) == training_fields(right)
+
+
 class Trainer:
     def __init__(self, config, training, validation, device, initial_weights=None):
         self.config = copy.deepcopy(config)
@@ -127,10 +140,13 @@ class Trainer:
             "augmentation_rng": self.augmentation_rng.get_state(),
         }
 
-    def restore(self, state):
+    def restore(self, state, *, allow_runtime_change=False):
         if state.get("format") != "andi-e4-v1":
             raise ValueError("Exact resume requires an E4 full-state checkpoint")
-        if state["config"] != self.config:
+        if allow_runtime_change:
+            if not same_training_config(state["config"], self.config):
+                raise ValueError("Migration requires matching training settings and prepared-data fingerprints")
+        elif state["config"] != self.config:
             raise ValueError("Exact resume configuration/provenance differs from checkpoint")
         self.model.load_state_dict(state["model"], strict=True)
         self.ema_model.load_state_dict(state["ema_model"], strict=True)
