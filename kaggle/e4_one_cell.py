@@ -264,12 +264,15 @@ def main(args):
             (output / "resume.json").write_text(json.dumps(
                 {"requested": requested, "resolved": resolved,
                  "migrated_runtime": bool(args.migrate_from_wandb),
+                 "allow_preprocessing_drift": args.allow_preprocessing_drift,
+                 "source_data_identity": saved["config"]["identity"] if args.migrate_from_wandb else None,
                  "source_backend": saved["config"]["backend"] if saved else None,
                  "checkpoint_storage": "wandb" if remote else "filesystem",
                  "save_steps": args.save_steps, "save_seconds": args.save_seconds}, indent=2) + "\n")
             if run:
                 run.config.update(config | {"resume_artifact": resolved,
                                             "migrated_runtime": bool(args.migrate_from_wandb),
+                                            "allow_preprocessing_drift": args.allow_preprocessing_drift,
                                             "source_backend": saved["config"]["backend"] if saved else None,
                                             "checkpoint_storage": "wandb" if remote else "filesystem",
                                             "save_steps": args.save_steps,
@@ -277,7 +280,8 @@ def main(args):
             trainer = Trainer(config, training, validation, device, initial_weights)
             store = CheckpointStore(output / "checkpoints", remote)
             if saved:
-                trainer.restore(saved, allow_runtime_change=bool(args.migrate_from_wandb))
+                trainer.restore(saved, allow_runtime_change=bool(args.migrate_from_wandb),
+                                allow_preprocessing_drift=args.allow_preprocessing_drift)
                 if args.filesystem_checkpoints and trainer.best_step is not None:
                     if trainer.best_step == trainer.global_step:
                         best = saved
@@ -286,9 +290,22 @@ def main(args):
                         _, best = wandb_checkpoints.recover(f"{origin}:best-step-{trainer.best_step}")
                     else:
                         best = torch.load(checkpoint.with_name("best.pt"), map_location="cpu", weights_only=False)
-                    if (not same_training_config(best["config"], config) or best["global_step"] != trainer.best_step
+                    best_config = best.get("validation_config", best["config"])
+                    if (not same_training_config(best_config, config,
+                                                 allow_preprocessing_drift=args.allow_preprocessing_drift)
+                            or best["global_step"] != trainer.best_step
                             or best["best_validation"] != trainer.best_validation):
                         raise ValueError("The saved best checkpoint differs from the recorded validation selection")
+                    if args.migrate_from_wandb:
+                        trainer.ema_model.load_state_dict(best["ema_model"], strict=True)
+                        try:
+                            old_score = trainer.best_validation
+                            trainer.best_validation = trainer.validate()
+                        finally:
+                            trainer.ema_model.load_state_dict(saved["ema_model"], strict=True)
+                        best = best | {"best_validation": trainer.best_validation, "validation_config": config}
+                        print(f"Re-scored EMA at step {trainer.best_step} on Bender: "
+                              f"{old_score:.8f} -> {trainer.best_validation:.8f}", flush=True)
                     atomic_save(best, store.directory / "best.pt")
                     del best
                 del saved
@@ -314,7 +331,7 @@ def main(args):
                 best = torch.load(best_path, map_location="cpu", weights_only=False)
                 selected_ref = str(best_path)
             compatible = (best["config"] == config if remote
-                          else same_training_config(best["config"], config))
+                          else same_training_config(best.get("validation_config", best["config"]), config))
             if (not compatible or best["global_step"] != trainer.best_step
                     or best["best_validation"] != trainer.best_validation):
                 raise ValueError("Best checkpoint differs from the recorded validation selection")
@@ -347,6 +364,8 @@ if __name__ == "__main__":
                                help="Resume a trusted filesystem checkpoint. Keep its sibling best.pt.")
     resume_options.add_argument("--migrate-from-wandb",
                                help="Continue a verified W&B checkpoint on a compatible new runtime")
+    parser.add_argument("--allow-preprocessing-drift", action="store_true",
+                        help="Allow changed tensor hashes during migration with identical ordered slices")
     parser.add_argument("--source-commit", help="Full Git SHA of the checkout, for nodes without Git")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int, help="Effective batch size per optimizer update")
@@ -363,6 +382,8 @@ if __name__ == "__main__":
         parser.error("--resume-local and --migrate-from-wandb require --filesystem-checkpoints")
     if arguments.migrate_from_wandb and arguments.local_only:
         parser.error("--migrate-from-wandb requires online W&B access")
+    if arguments.allow_preprocessing_drift and not arguments.migrate_from_wandb:
+        parser.error("--allow-preprocessing-drift requires --migrate-from-wandb")
     if arguments.resume and arguments.filesystem_checkpoints:
         parser.error("--resume requires W&B checkpoint storage. Use --resume-local for filesystem checkpoints.")
     if arguments.source_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", arguments.source_commit):

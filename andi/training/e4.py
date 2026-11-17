@@ -76,15 +76,18 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def same_training_config(left, right):
+def same_training_config(left, right, *, allow_preprocessing_drift=False):
     """Compare training and dataset identity across a runtime or source change."""
     def training_fields(config):
-        identity = config.get("identity", {})
-        return {
-            key: ({name: value for name, value in identity.items() if name != "commit"}
-                  if key == "identity" else value)
-            for key, value in config.items() if key != "backend"
-        }
+        fields = {key: value for key, value in config.items() if key != "backend"}
+        if "identity" in fields:
+            identity = fields["identity"] = fields["identity"].copy()
+            identity.pop("commit", None)
+            if allow_preprocessing_drift:
+                for split in ("train", "validation"):
+                    identity[split] = {key: value for key, value in identity[split].items()
+                                       if key != "tensor_sha256"}
+        return fields
 
     return training_fields(left) == training_fields(right)
 
@@ -140,11 +143,12 @@ class Trainer:
             "augmentation_rng": self.augmentation_rng.get_state(),
         }
 
-    def restore(self, state, *, allow_runtime_change=False):
+    def restore(self, state, *, allow_runtime_change=False, allow_preprocessing_drift=False):
         if state.get("format") != "andi-e4-v1":
             raise ValueError("Exact resume requires an E4 full-state checkpoint")
         if allow_runtime_change:
-            if not same_training_config(state["config"], self.config):
+            if not same_training_config(state["config"], self.config,
+                                        allow_preprocessing_drift=allow_preprocessing_drift):
                 raise ValueError("Migration requires matching training settings and prepared-data fingerprints")
         elif state["config"] != self.config:
             raise ValueError("Exact resume configuration/provenance differs from checkpoint")

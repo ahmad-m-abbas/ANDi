@@ -154,7 +154,11 @@ class E4Tests(unittest.TestCase):
 
         config = self.config() | {
             "backend": {"device": "source"},
-            "identity": {"commit": "original", "train": {"tensor_sha256": "fixed"}},
+            "identity": {
+                "commit": "original",
+                "train": {"tensor_sha256": "fixed", "slice_index_sha256": "train-order"},
+                "validation": {"tensor_sha256": "fixed", "slice_index_sha256": "val-order"},
+            },
         }
         data = torch.rand(6, 4, 16, 16)
         source = Trainer(config, data, data[:2], "cpu")
@@ -170,15 +174,24 @@ class E4Tests(unittest.TestCase):
         destination = Trainer(destination_config, data, data[:2], "cpu")
         with self.assertRaisesRegex(ValueError, "Exact resume"):
             destination.restore(checkpoint)
-        changed_data = checkpoint["config"]["identity"] | {"train": {"tensor_sha256": "different"}}
+        changed_data = checkpoint["config"]["identity"] | {
+            "train": config["identity"]["train"] | {"tensor_sha256": "different"}
+        }
         incompatible = checkpoint | {"config": config | {"identity": changed_data}}
         with self.assertRaisesRegex(ValueError, "prepared-data fingerprints"):
             destination.restore(incompatible, allow_runtime_change=True)
         incompatible = checkpoint | {"config": config | {"consistency_lambda": 0.5}}
         with self.assertRaisesRegex(ValueError, "training settings"):
-            destination.restore(incompatible, allow_runtime_change=True)
+            destination.restore(incompatible, allow_runtime_change=True, allow_preprocessing_drift=True)
+        reordered = changed_data | {
+            "train": changed_data["train"] | {"slice_index_sha256": "different-order"}
+        }
+        incompatible = checkpoint | {"config": config | {"identity": reordered}}
+        with self.assertRaisesRegex(ValueError, "prepared-data fingerprints"):
+            destination.restore(incompatible, allow_runtime_change=True, allow_preprocessing_drift=True)
 
-        destination.restore(checkpoint, allow_runtime_change=True)
+        drifted = checkpoint | {"config": config | {"identity": changed_data}}
+        destination.restore(drifted, allow_runtime_change=True, allow_preprocessing_drift=True)
         destination.step()
         assert_same(expected | {"config": destination_config}, destination.snapshot())
 
