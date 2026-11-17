@@ -184,14 +184,17 @@ def main(args):
         remote = None if args.filesystem_checkpoints else wandb_checkpoints
         saved = None
         resolved = None
+        local_source = args.resume_local or args.migrate_local
+        migrating_runtime = bool(args.migrate_from_wandb or args.migrate_local)
         requested = args.migrate_from_wandb or args.resume or (
-            str(args.resume_local) if args.resume_local else None
+            str(local_source) if local_source else None
         )
-        if args.resume_local:
-            checkpoint = args.resume_local.resolve(strict=True)
+        if local_source:
+            checkpoint = local_source.resolve(strict=True)
             # Full E4 checkpoints contain pickled RNG state. Use only trusted files.
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             resolved = str(checkpoint)
+            print(f"Loaded local checkpoint {resolved} at step {saved['global_step']}", flush=True)
         elif args.resume:
             if not remote:
                 raise ValueError("Use online mode to restore a verified W&B checkpoint")
@@ -263,15 +266,15 @@ def main(args):
             (output / "configuration.json").write_text(json.dumps(config, indent=2) + "\n")
             (output / "resume.json").write_text(json.dumps(
                 {"requested": requested, "resolved": resolved,
-                 "migrated_runtime": bool(args.migrate_from_wandb),
+                 "migrated_runtime": migrating_runtime,
                  "allow_preprocessing_drift": args.allow_preprocessing_drift,
-                 "source_data_identity": saved["config"]["identity"] if args.migrate_from_wandb else None,
+                 "source_data_identity": saved["config"]["identity"] if migrating_runtime else None,
                  "source_backend": saved["config"]["backend"] if saved else None,
                  "checkpoint_storage": "wandb" if remote else "filesystem",
                  "save_steps": args.save_steps, "save_seconds": args.save_seconds}, indent=2) + "\n")
             if run:
                 run.config.update(config | {"resume_artifact": resolved,
-                                            "migrated_runtime": bool(args.migrate_from_wandb),
+                                            "migrated_runtime": migrating_runtime,
                                             "allow_preprocessing_drift": args.allow_preprocessing_drift,
                                             "source_backend": saved["config"]["backend"] if saved else None,
                                             "checkpoint_storage": "wandb" if remote else "filesystem",
@@ -280,7 +283,7 @@ def main(args):
             trainer = Trainer(config, training, validation, device, initial_weights)
             store = CheckpointStore(output / "checkpoints", remote)
             if saved:
-                trainer.restore(saved, allow_runtime_change=bool(args.migrate_from_wandb),
+                trainer.restore(saved, allow_runtime_change=migrating_runtime,
                                 allow_preprocessing_drift=args.allow_preprocessing_drift)
                 if args.filesystem_checkpoints and trainer.best_step is not None:
                     if trainer.best_step == trainer.global_step:
@@ -296,7 +299,7 @@ def main(args):
                             or best["global_step"] != trainer.best_step
                             or best["best_validation"] != trainer.best_validation):
                         raise ValueError("The saved best checkpoint differs from the recorded validation selection")
-                    if args.migrate_from_wandb:
+                    if migrating_runtime:
                         trainer.ema_model.load_state_dict(best["ema_model"], strict=True)
                         try:
                             old_score = trainer.best_validation
@@ -304,12 +307,12 @@ def main(args):
                         finally:
                             trainer.ema_model.load_state_dict(saved["ema_model"], strict=True)
                         best = best | {"best_validation": trainer.best_validation, "validation_config": config}
-                        print(f"Re-scored EMA at step {trainer.best_step} on Bender: "
+                        print(f"Re-scored EMA at step {trainer.best_step} on the destination runtime: "
                               f"{old_score:.8f} -> {trainer.best_validation:.8f}", flush=True)
                     atomic_save(best, store.directory / "best.pt")
                     del best
                 del saved
-                if args.migrate_from_wandb:
+                if migrating_runtime:
                     trainer.save(store)
             if args.smoke and trainer.global_step == 0:
                 trainer = smoke_resume(trainer, store, remote, config, training, validation, device, run)
@@ -364,6 +367,8 @@ if __name__ == "__main__":
                                help="Resume a trusted filesystem checkpoint. Keep its sibling best.pt.")
     resume_options.add_argument("--migrate-from-wandb",
                                help="Continue a verified W&B checkpoint on a compatible new runtime")
+    resume_options.add_argument("--migrate-local", type=Path,
+                               help="Continue a trusted filesystem checkpoint on a compatible new runtime")
     parser.add_argument("--allow-preprocessing-drift", action="store_true",
                         help="Allow changed tensor hashes during migration with identical ordered slices")
     parser.add_argument("--source-commit", help="Full Git SHA of the checkout, for nodes without Git")
@@ -376,14 +381,15 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=Path("/kaggle/working/andi-e4"))
     parser.add_argument("--local-only", action="store_true", help="Explicit local smoke check without durability")
     arguments = parser.parse_args()
-    if arguments.initialize and (arguments.resume or arguments.resume_local or arguments.migrate_from_wandb):
+    filesystem_resume = arguments.resume_local or arguments.migrate_from_wandb or arguments.migrate_local
+    if arguments.initialize and (arguments.resume or filesystem_resume):
         parser.error("Choose pretrained initialization or continuation from a checkpoint")
-    if (arguments.resume_local or arguments.migrate_from_wandb) and not arguments.filesystem_checkpoints:
-        parser.error("--resume-local and --migrate-from-wandb require --filesystem-checkpoints")
+    if filesystem_resume and not arguments.filesystem_checkpoints:
+        parser.error("Local resume and migration modes require --filesystem-checkpoints")
     if arguments.migrate_from_wandb and arguments.local_only:
         parser.error("--migrate-from-wandb requires online W&B access")
-    if arguments.allow_preprocessing_drift and not arguments.migrate_from_wandb:
-        parser.error("--allow-preprocessing-drift requires --migrate-from-wandb")
+    if arguments.allow_preprocessing_drift and not (arguments.migrate_from_wandb or arguments.migrate_local):
+        parser.error("--allow-preprocessing-drift requires a migration mode")
     if arguments.resume and arguments.filesystem_checkpoints:
         parser.error("--resume requires W&B checkpoint storage. Use --resume-local for filesystem checkpoints.")
     if arguments.source_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", arguments.source_commit):
