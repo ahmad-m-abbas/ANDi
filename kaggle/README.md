@@ -1,5 +1,7 @@
 # Run BraTS21 E1 on Kaggle
 
+For consistency-regularized training and durable resume, see [E4 on Kaggle](E4.md).
+
 The jobs run in Kaggle after `kaggle kernels push` returns. All inference uses the frozen EMA checkpoint, the repository's BraTS21 split and preprocessing, Gaussian evaluation noise, and the E1 postprocessing and metrics. CUDA uses its own matched noise draws and 125-step baseline. Its speedup describes the selected Kaggle GPU.
 
 ## Setup

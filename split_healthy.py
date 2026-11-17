@@ -27,60 +27,54 @@ def main(args):
     split_and_save(args)
 
 
+def healthy_slice_batch(root, subject, resize, limit=None):
+    """Return normalized, resized slices with nonempty FLAIR and no lesion labels."""
+    directory = os.path.join(root, subject)
+    mask = np.asarray(
+        nib.load(os.path.join(directory, subject + "_seg.nii.gz")).dataobj, dtype=int
+    )
+    images = []
+    for modality in ("flair", "t1", "t1ce", "t2"):
+        path = os.path.join(directory, f"{subject}_{modality}.nii.gz")
+        images.append(torch.from_numpy(np.asarray(nib.load(path).dataobj, dtype=float)))
+    volume = normalize_volume(torch.stack(images).float())
+    indices = [
+        index for index in range(volume.shape[-1])
+        if torch.count_nonzero(volume[0, :, :, index])
+        and not (mask[:, :, index] >= 1).any()
+    ][:limit]
+    if not indices:
+        return indices, None
+    slices = resize(volume.permute(3, 0, 1, 2)[indices]).numpy()
+    return indices, slices
+
+
 def split_and_save(args):
     df = pd.read_csv(args.input_file)
     root_path = args.data_set
-    os.makedirs(f"{args.data_set}/healthy_slices", exist_ok=True)
-    ids = df.loc[:, df.columns[0]]
-    my_transform = transforms.Resize(args.resolution, antialias=True)
+    os.makedirs(f"{root_path}/healthy_slices", exist_ok=True)
+    ids = df.iloc[:, 0]
+    resize = transforms.Resize(args.resolution, antialias=True)
     global_ids = []
     global_slices = []
-    data_types = ["_flair.nii.gz", "_t1.nii.gz", "_t1ce.nii.gz", "_t2.nii.gz"]
-    pbar = tqdm(ids)
-    map_size = 0
-    for id in pbar:
-        map_size += (
-            sum(
-                d.stat().st_size
-                for d in os.scandir(os.path.join(args.data_set, id))
-                if d.is_file()
-            )
-            * 2
-        )
-    env = lmdb.open(str(f"{args.data_set}/healthy_slices"), map_size=map_size)
+    map_size = 2 * sum(
+        entry.stat().st_size
+        for subject in ids
+        for entry in os.scandir(os.path.join(root_path, subject))
+        if entry.is_file()
+    )
+    env = lmdb.open(f"{root_path}/healthy_slices", map_size=map_size)
     with env.begin(write=True) as txn:
         num = 0
-        for id in pbar:
-            my_ids = []
-            healthy_slices = []
-            my_slices = []
-            images = []
-            mask_path = os.path.join(root_path, id, id + "_seg.nii.gz")
-            mask = np.asarray(nib.load(mask_path).dataobj, dtype=int)
-            for data_type in data_types:
-                img_path = os.path.join(args.data_set, id, id + data_type)
-                img = np.asarray(nib.load(img_path).dataobj, dtype=float)
-                images.append(img)
-            img = torch.stack([torch.from_numpy(x) for x in images], dim=0)
-            img = normalize_volume(img.float())
-            mask[mask >= 1] = 1
-            for i in range(img.shape[3]):
-                my_slice = img[0, :, :, i]
-                my_mask = mask[:, :, i]
-                if (
-                    torch.count_nonzero(my_slice) and 1 not in my_mask
-                ):  # filter out empty and slices containing an anomaly
-                    my_ids.append(id)
-                    healthy_slices.append(i)
-                    my_slices.append(img[None, :, :, :, i])
-            my_slices = torch.cat(my_slices)
-            my_slices = my_transform(my_slices).numpy()
-            for data in my_slices:
-                key = f"{num:08}"
+        for subject in tqdm(ids):
+            indices, slices = healthy_slice_batch(root_path, subject, resize)
+            if slices is None:
+                continue
+            for image in slices:
+                txn.put(f"{num:08}".encode("ascii"), pickle.dumps(image))
                 num += 1
-                txn.put(key.encode("ascii"), pickle.dumps(data))
-            global_ids.extend(my_ids)
-            global_slices.extend(healthy_slices)
+            global_ids.extend([subject] * len(indices))
+            global_slices.extend(indices)
     env.close()
     healthy_dict = {df.columns[0]: global_ids, "Slice": global_slices}
     df_healthy = pd.DataFrame(healthy_dict)
